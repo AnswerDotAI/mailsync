@@ -15,7 +15,17 @@ classifiers = [
   "Programming Language :: Python :: 3 :: Only",
 ]
 
-dependencies = []
+dependencies = [
+  "apsw>=3.53.4.0",
+  "fastcore>=2.2.18",
+  "fastgws>=0.2.8",
+]
+
+[project.scripts]
+mailsync = "mailsync.cli:main"
+mailsync-search = "mailsync.cli:search"
+mailsync-status = "mailsync.cli:status"
+mailsync-backup = "mailsync.cli:backup"
 
 [project.optional-dependencies]
 dev = [
