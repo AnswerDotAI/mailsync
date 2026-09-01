@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastgws import GMail
 from fastgws.auth import oauth_creds
-from fastspec.errors import APIError
+from fasttransport.errors import APIError
 
 from .core import Store, db_path
 

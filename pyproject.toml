@@ -18,6 +18,7 @@ classifiers = [
 dependencies = [
   "apsw>=3.53.4.0",
   "fastcore>=2.2.18",
+  "fasttransport>=0.0.2",
   "fastgws>=0.2.8",
 ]
 
