@@ -86,7 +86,7 @@ class GmailMirror:
             for i in range(0, len(ids), self.batch_size):
                 mids = ids[i:i+self.batch_size]
                 calls = [dict(user_id='me', id=mid, format=format, fields=fields) for mid in mids]
-                values = await self.gmail.users.messages.get.batch(calls, chunk=self.batch_size, return_exceptions=True)
+                values = await self.gmail.users.messages.get.batch(calls, chunk=self.batch_size, return_exceptions=True, n_retries=8)
                 for value in values:
                     if isinstance(value, APIError):
                         if value.status_code == 404: continue
