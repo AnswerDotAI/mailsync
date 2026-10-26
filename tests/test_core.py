@@ -1,7 +1,7 @@
 from email.message import EmailMessage
 
 from mailsync.core import Store, parse_email
-from mailsync.sync import changes, selected
+from mailsync.sync import changes, keep, selected
 
 
 def test_parse_email_prefers_plain_and_skips_attachment():
@@ -24,6 +24,9 @@ def test_mirror_state_logic():
     history = [{'messagesAdded':[{'message':{'id':'a'}}]},
         {'labelsRemoved':[{'message':{'id':'b'}}]}, {'messagesDeleted':[{'message':{'id':'c'}}]}]
     assert changes(history) == ({'a','b','c'}, {'a'}, {'c'})
+    assert keep(dict(internalDate='5', labelIds=['work']), {'work'}, set(), floor=5)
+    assert not keep(dict(internalDate='4', labelIds=['work']), {'work'}, set(), floor=5)
+    assert keep(dict(labelIds=['work']), {'work'}, set())
 
 
 def test_store_replaces_derived_state(tmp_path):

@@ -32,6 +32,11 @@ def selected(label_ids, include, exclude):
     label_ids = set(label_ids)
     return (not include or bool(label_ids & include)) and not bool(label_ids & exclude)
 
+def keep(msg, include, exclude, floor=None):
+    "Whether a fetched message belongs in the mirror: label-selected, and dated on or after `floor` when one is given"
+    if floor is not None and int(msg['internalDate']) < floor: return False
+    return selected(msg.get('labelIds', []), include, exclude)
+
 
 def changes(history):
     "Return (all changed, added, deleted) message ID sets"
@@ -67,6 +72,7 @@ class GmailMirror:
         return labels,include,exclude
 
     async def messages(self, ids, format='raw'):
+        "Fetch `ids` from Gmail in batches of `batch_size`, yielding each batch as a list of message dicts; a 404 drops that message"
         ids = list(ids)
         done,reported = 0,-1
         def emit():
@@ -81,22 +87,22 @@ class GmailMirror:
         reporter = asyncio.create_task(report()) if ids and self.progress and self.progress_seconds else None
         if reporter: emit()
         fields = 'id,threadId,labelIds,snippet,historyId,internalDate,sizeEstimate,raw' if format == 'raw' else 'id,labelIds'
-        results = []
         try:
             for i in range(0, len(ids), self.batch_size):
                 mids = ids[i:i+self.batch_size]
                 calls = [dict(user_id='me', id=mid, format=format, fields=fields) for mid in mids]
                 values = await self.gmail.users.messages.get.batch(calls, chunk=self.batch_size, return_exceptions=True, n_retries=8)
+                batch = []
                 for value in values:
                     if isinstance(value, APIError):
-                        if value.status_code == 404: continue
+                        if value.status_code == 404 or value.error_type == 'FAILED_PRECONDITION': continue  # gone, or has no RFC 822 form (chats)
                         raise value
                     if format == 'raw':
                         raw = value.get('raw', '')
                         value['raw'] = urlsafe_b64decode(raw + '='*(-len(raw)%4))
-                    results.append(value)
+                    batch.append(value)
                 done += len(mids)
-            return results
+                yield batch
         finally:
             if reporter:
                 reporter.cancel()
@@ -111,6 +117,19 @@ class GmailMirror:
             ids.update(x['id'] for x in page.get('messages', []))
         return ids
 
+    async def _store(self, ids, format, include, exclude, floor=None):
+        "Fetch `ids` in `format` and write each batch as it arrives; returns (ids Gmail returned, ids kept)"
+        seen,kept = set(),set()
+        async for batch in self.messages(ids, format):
+            with self.store.db:
+                for msg in batch:
+                    seen.add(msg['id'])
+                    if not keep(msg, include, exclude, floor): continue
+                    kept.add(msg['id'])
+                    if format == 'raw': self.store.put(msg)
+                    else: self.store.put_labels(msg['id'], msg.get('labelIds', []))
+        return seen,kept
+
     async def reconcile(self):
         profile = await self.gmail.users.get_profile(user_id='me')
         highwater = profile['historyId']
@@ -118,23 +137,19 @@ class GmailMirror:
         floor = self.store.state('sync_floor')
         if floor is None:
             floor = int((datetime.now(timezone.utc) - timedelta(days=self.cfg.initial_lookback_days)).timestamp()*1000)
-        listed,local,managed = await self.listed_ids(int(floor)),self.store.ids(),self.store.ids(floor)
+        floor = int(floor)
+        listed,local,managed = await self.listed_ids(floor),self.store.ids(),self.store.ids(floor)
         candidates = listed - (local-managed)
-        raw = {x['id']:x for x in await self.messages(candidates-local)}
-        minimal = {x['id']:x for x in await self.messages(candidates&managed, 'minimal')}
-        raw = {mid:x for mid,x in raw.items() if int(x['internalDate']) >= int(floor) and selected(x.get('labelIds', []), include, exclude)}
-        minimal = {mid:x for mid,x in minimal.items() if selected(x.get('labelIds', []), include, exclude)}
-        remote = set(raw)|set(minimal)
-        removed = managed - remote
+        _,raw_kept = await self._store(candidates-local, 'raw', include, exclude, floor)
+        _,min_kept = await self._store(candidates&managed, 'minimal', include, exclude)
+        removed = managed - (raw_kept|min_kept)
         with self.store.db:
             self.store.labels(labels)
             n_removed = self.store.delete(removed)
-            for msg in raw.values(): self.store.put(msg)
-            for mid,msg in minimal.items(): self.store.put_labels(mid, msg.get('labelIds', []))
             self.store.set_state('sync_floor', floor)
             self.store.set_state('history_id', highwater)
             self.store.set_state('selection', _fingerprint(self.cfg))
-        return len(remote),n_removed
+        return len(raw_kept)+len(min_kept),n_removed
 
     async def incremental(self):
         start = self.store.state('history_id')
@@ -159,20 +174,16 @@ class GmailMirror:
         current = (changed-deleted_only) - (local-managed)
         raw_ids = (added&current) | (current-local)
         minimal_ids = (current&managed) - raw_ids
-        raw = {x['id']:x for x in await self.messages(raw_ids)}
-        minimal = {x['id']:x for x in await self.messages(minimal_ids, 'minimal')}
-        missing = ((raw_ids-set(raw)) | (minimal_ids-set(minimal))) & managed
-        raw_keep = {mid:x for mid,x in raw.items() if int(x['internalDate']) >= floor and selected(x.get('labelIds', []), include, exclude)}
-        minimal_keep = {mid:x for mid,x in minimal.items() if selected(x.get('labelIds', []), include, exclude)}
-        removed = (deleted_only&managed) | missing | ((set(raw)&managed)-set(raw_keep)) | (set(minimal)-set(minimal_keep))
+        raw_seen,raw_kept = await self._store(raw_ids, 'raw', include, exclude, floor)
+        min_seen,min_kept = await self._store(minimal_ids, 'minimal', include, exclude)
+        missing = ((raw_ids-raw_seen) | (minimal_ids-min_seen)) & managed
+        removed = (deleted_only&managed) | missing | ((raw_seen&managed)-raw_kept) | (min_seen-min_kept)
         with self.store.db:
             self.store.labels(labels)
             n_removed = self.store.delete(removed)
-            for msg in raw_keep.values(): self.store.put(msg)
-            for mid,msg in minimal_keep.items(): self.store.put_labels(mid, msg.get('labelIds', []))
             self.store.set_state('history_id', highwater)
             self.store.set_state('selection', _fingerprint(self.cfg))
-        return len(raw_keep)+len(minimal_keep),n_removed
+        return len(raw_kept)+len(min_kept),n_removed
 
     async def reconcile_catchup(self):
         "Reconcile the managed set, then replay changes since its captured high-water mark"
