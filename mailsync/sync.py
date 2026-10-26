@@ -95,7 +95,7 @@ class GmailMirror:
                 batch = []
                 for value in values:
                     if isinstance(value, APIError):
-                        if value.status_code == 404: continue
+                        if value.status_code == 404 or value.error_type == 'FAILED_PRECONDITION': continue  # gone, or has no RFC 822 form (chats)
                         raise value
                     if format == 'raw':
                         raw = value.get('raw', '')
